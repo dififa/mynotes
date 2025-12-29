@@ -33,6 +33,9 @@ const CONST_NAME_MAP = new Map();
 const ANON_STRUCTS = new Map();
 let anonStructCounter = 0;
 
+// EMBEDDED FIELDS TRACKER: Map<structName, Set<embeddedTypeName>>
+const EMBEDDED_FIELDS = new Map();
+
 // REWRITER
 // Logic untuk mengubah pola sintaks spesifik Go menjadi V (misal: stdlib, deklarasi variabel).
 const SyntaxRewriter = {
@@ -40,7 +43,7 @@ const SyntaxRewriter = {
         return specs
             .map((s) => {
                 let path = s.Path.Value.replace(/"/g, "");
-                if (path === "fmt" || path === "errors") return "";
+                if (path === "fmt" || path === "errors" || path === "strings") return "";
                 if (path === "encoding/json") path = "json";
                 path = path.replace(/\//g, ".");
                 return `import ${path}`;
@@ -67,6 +70,9 @@ const SyntaxRewriter = {
                     
                     if (s.Values && s.Values.length > 0) {
                         const val = transpile(s.Values[0], ctx);
+                        if (ctx.knownInterfaces && ctx.knownInterfaces.has(type)) {
+                            return `mut ${name} := ${type}(${val})`;
+                        }
                         return `mut ${name} := ${val}`;
                     }
                     
@@ -109,7 +115,8 @@ const SyntaxRewriter = {
         if (!recvFieldList) return "";
         const recvList = recvFieldList.List[0];
         const rName = recvList.Names[0].Name;
-        const rType = transpile(recvList.Type, ctx);
+        const typeCtx = { ...ctx, inTypeContext: true };
+        const rType = transpile(recvList.Type, typeCtx);
 
         let isMut = false;
         if (recvList.Type._type === "StarExpr") isMut = true;
@@ -143,7 +150,6 @@ const SyntaxRewriter = {
         if ((funcName === "fmt.Printf" || funcName === "fmt.Sprintf") && argsNodes.length > 0) {
             const fmtNode = argsNodes[0];
             if (fmtNode._type === "BasicLit" && fmtNode.Kind === "STRING") {
-                // Remove outer quotes safely
                 let fmtStr = fmtNode.Value;
                 if (fmtStr.startsWith('"') && fmtStr.endsWith('"')) {
                     fmtStr = fmtStr.slice(1, -1);
@@ -165,14 +171,16 @@ const SyntaxRewriter = {
                     }
                 );
 
+                const quote = vFmtStr.includes("'") ? '"' : "'";
+
                 if (funcName === "fmt.Sprintf") {
-                    return `'${vFmtStr}'`;
+                    return `${quote}${vFmtStr}${quote}`;
                 }
 
                 if (vFmtStr.endsWith("\\n")) {
-                     return `println('${vFmtStr.slice(0, -2)}')`;
+                     return `println(${quote}${vFmtStr.slice(0, -2)}${quote})`;
                 }
-                return `print('${vFmtStr}')`;
+                return `print(${quote}${vFmtStr}${quote})`;
             }
             if (funcName === "fmt.Sprintf") return `fmt.sprintf(${args})`;
             return `print(${args})`;
@@ -194,6 +202,50 @@ const SyntaxRewriter = {
             return `error(${args})`;
         }
 
+        if (funcName === "strings.to_upper" && argsNodes.length >= 1) {
+            const s = transpile(argsNodes[0], ctx);
+            return `${s}.to_upper()`;
+        }
+        if (funcName === "strings.to_lower" && argsNodes.length >= 1) {
+            const s = transpile(argsNodes[0], ctx);
+            return `${s}.to_lower()`;
+        }
+        if (funcName === "strings.contains" && argsNodes.length >= 2) {
+            const s = transpile(argsNodes[0], ctx);
+            const substr = transpile(argsNodes[1], ctx);
+            return `${s}.contains(${substr})`;
+        }
+        if (funcName === "strings.has_prefix" && argsNodes.length >= 2) {
+            const s = transpile(argsNodes[0], ctx);
+            const prefix = transpile(argsNodes[1], ctx);
+            return `${s}.starts_with(${prefix})`;
+        }
+        if (funcName === "strings.has_suffix" && argsNodes.length >= 2) {
+            const s = transpile(argsNodes[0], ctx);
+            const suffix = transpile(argsNodes[1], ctx);
+            return `${s}.ends_with(${suffix})`;
+        }
+        if (funcName === "strings.split" && argsNodes.length >= 2) {
+            const s = transpile(argsNodes[0], ctx);
+            const sep = transpile(argsNodes[1], ctx);
+            return `${s}.split(${sep})`;
+        }
+        if (funcName === "strings.join" && argsNodes.length >= 2) {
+            const arr = transpile(argsNodes[0], ctx);
+            const sep = transpile(argsNodes[1], ctx);
+            return `${arr}.join(${sep})`;
+        }
+        if (funcName === "strings.replace" && argsNodes.length >= 3) {
+            const s = transpile(argsNodes[0], ctx);
+            const old = transpile(argsNodes[1], ctx);
+            const newStr = transpile(argsNodes[2], ctx);
+            return `${s}.replace(${old}, ${newStr})`;
+        }
+        if (funcName === "strings.trim_space" && argsNodes.length >= 1) {
+            const s = transpile(argsNodes[0], ctx);
+            return `${s}.trim_space()`;
+        }
+
         return null;
     },
 };
@@ -208,7 +260,14 @@ function transpile(node, ctx = { scope: "global" }) {
     // RECURSION
     // Mesin penggerak yang menelusuri list anak (children) secara rekursif.
     if (Array.isArray(node)) {
-        return node.map((n) => transpile(n, ctx)).join("\n");
+        let output = [];
+        for (let i = 0; i < node.length; i++) {
+            if (node[i]._consumed) continue;
+            const remaining = node.slice(i + 1);
+            const res = transpile(node[i], { ...ctx, remainingStmts: remaining });
+            if (res) output.push(res);
+        }
+        return output.join("\n");
     }
 
     if (typeof node !== "object") return node;
@@ -324,6 +383,21 @@ fn do_work() ! {
             const typeGenerics = transpileGenericParams(node.TypeParams, ctx);
             const typeBody = transpile(node.Type, { ...ctx, inTypeSpec: true });
             if (node.Type._type === "StructType") {
+                const embeddedSet = new Set();
+                if (node.Type.Fields && node.Type.Fields.List) {
+                    node.Type.Fields.List.forEach(f => {
+                        if (!f.Names || f.Names.length === 0) {
+                            if (f.Type._type === "Ident") {
+                                embeddedSet.add(f.Type.Name);
+                            } else if (f.Type._type === "StarExpr" && f.Type.X._type === "Ident") {
+                                embeddedSet.add(f.Type.X.Name);
+                            }
+                        }
+                    });
+                }
+                if (embeddedSet.size > 0) {
+                    EMBEDDED_FIELDS.set(typeName, embeddedSet);
+                }
                 return `struct ${typeName}${typeGenerics} ${typeBody}`;
             }
             if (node.Type._type === "InterfaceType") {
@@ -332,11 +406,12 @@ fn do_work() ! {
             return `type ${typeName}${typeGenerics} = ${typeBody}`;
 
         case "InterfaceType":
-            if (!node.Methods || !node.Methods.List) return "{}";
+            if (!node.Methods || !node.Methods.List || node.Methods.List.length === 0) {
+                return "voidptr";
+            }
             const interfaceMethods = node.Methods.List.map(f => {
                  if (!f.Names || f.Names.length === 0) {
-                      // Embedded interface
-                      return transpile(f.Type, ctx);
+                      return transpile(f.Type, { ...ctx, inTypeContext: true });
                  }
                  const name = toSnakeCase(f.Names[0].Name);
                  const funcType = f.Type;
@@ -354,7 +429,7 @@ fn do_work() ! {
 
             allStructFields.forEach((f) => {
                 if (!f.Names || f.Names.length === 0) {
-                     embeddedFields.push(transpile(f.Type, ctx));
+                     embeddedFields.push(transpile(f.Type, { ...ctx, inTypeContext: true }));
                 } else {
                      regularFields.push(f);
                 }
@@ -363,7 +438,7 @@ fn do_work() ! {
             const regularList = regularFields
                 .map((f) => {
                     const name = f.Names ? toSnakeCase(f.Names[0].Name) : "";
-                    const type = transpile(f.Type, ctx);
+                    const type = transpile(f.Type, { ...ctx, inTypeContext: true });
                     const tag = f.Tag
                         ? SyntaxRewriter.structTag(f.Tag.Value)
                         : "";
@@ -419,6 +494,11 @@ fn do_work() ! {
             const chanVal = transpile(node.Value, ctx);
             return `chan ${chanVal}`;
 
+        case "FuncType":
+            const ftParams = transpileParams(node.Params, ctx);
+            const ftResults = transpileResults(node.Results, ctx);
+            return `fn${ftParams}${ftResults}`;
+
         case "FuncDecl":
             const funcName =
                 node.Name.Name === "main"
@@ -462,12 +542,26 @@ fn do_work() ! {
                 });
             }
 
+            let funcResultTypes = [];
+            if (funcType.Results && funcType.Results.List) {
+                 // We need to iterate carefully as List is Fields
+                 funcType.Results.List.forEach(f => {
+                     const t = transpile(f.Type, ctx);
+                     if (f.Names) {
+                         f.Names.forEach(() => funcResultTypes.push(t));
+                     } else {
+                         funcResultTypes.push(t);
+                     }
+                 });
+            }
+
             const bodyCtx = { 
                 ...ctx, 
                 scope: "local", 
                 namedReturns: namedReturns.length > 0 ? namedReturns : undefined,
                 scopeVars: fnScopeVars,
-                variableMapping: {} 
+                variableMapping: {},
+                funcResultTypes: funcResultTypes
             };
             
             // Note: node.Body is a BlockStmt. 
@@ -567,6 +661,45 @@ fn do_work() ! {
                                  }
                              }
                          }
+
+                         // Single Error Return: err := func()
+                         if (stmt.Lhs.length === 1 && stmt.Rhs.length === 1 && stmt.Rhs[0]._type === "CallExpr") {
+                             const lhs = stmt.Lhs[0];
+                             if (lhs._type === "Ident" && (lhs.Name === "err" || lhs.Name.startsWith("err"))) {
+                                  const errName = lhs.Name;
+                                  const condStr = transpile(nextStmt.Cond, blockCtx);
+                                  if (condStr.includes(`${errName} != nil`) || condStr.includes(`${errName} != none`)) {
+                                      const callExpr = transpile(stmt.Rhs[0], blockCtx);
+                                      const mapping = Object.assign({}, blockCtx.variableMapping || {});
+                                      mapping[errName] = 'err';
+                                      const errCtx = { ...blockCtx, scope: 'local', variableMapping: mapping };
+                                      
+                                      const ifBody = transpile(nextStmt.Body, errCtx);
+                                      
+                                      if (nextStmt.Else) {
+                                          const successVar = `${errName}_success`;
+                                          const successCtx = cloneContext(blockCtx);
+                                          const elseBody = transpile(nextStmt.Else, successCtx); 
+                                          
+                                          lines.push(`mut ${successVar} := true`);
+                                          lines.push(`${callExpr} or {`);
+                                          lines.push(`    ${ifBody.replace(/^{\s*/, "").replace(/\s*}$/, "")}`);
+                                          lines.push(`    ${successVar} = false`);
+                                          lines.push(`}`);
+                                          
+                                          if (elseBody.startsWith("{")) {
+                                              lines.push(`if ${successVar} ${elseBody}`);
+                                          } else {
+                                              lines.push(`if ${successVar} {\n    ${elseBody}\n}`);
+                                          }
+                                          i++; continue;
+                                      } else {
+                                          lines.push(`${callExpr} or ${ifBody}`);
+                                          i++; continue;
+                                      }
+                                  }
+                             }
+                         }
                     }
                 }
                 
@@ -586,7 +719,8 @@ fn do_work() ! {
 
         case "CallExpr":
             const fun = transpile(node.Fun, ctx);
-            const argsList = node.Args ? node.Args.map((n) => transpile(n, ctx)) : [];
+            const callArgCtx = { ...ctx, inCallArg: true };
+            const argsList = node.Args ? node.Args.map((n) => transpile(n, callArgCtx)) : [];
             
             // Handle variadic expansion (slice...) -> ...slice in V
             if (node.Ellipsis) {
@@ -716,9 +850,10 @@ fn do_work() ! {
             if (x === "fmt") return `fmt.${sel}`;
             if (GO_STD_PACKAGES.has(x)) return `${x}.${toSnakeCase(sel)}`;
             
-            // Heuristic: If selector matches a known struct, assume embedded field access
-            if (ctx.knownStructs && ctx.knownStructs.has(sel)) {
-                 return `${x}.${sel}`;
+            for (const embeddedSet of EMBEDDED_FIELDS.values()) {
+                if (embeddedSet.has(sel)) {
+                    return `${x}.${sel}`;
+                }
             }
             
             return `${x}.${toSnakeCase(sel)}`;
@@ -728,7 +863,9 @@ fn do_work() ! {
                 let val = node.Value;
                 if (val.startsWith('"')) {
                     const content = val.slice(1, -1);
-                    if (ctx.inTemplate || content.includes("'")) return `"${content}"`;
+                    if (ctx.inTemplate || content.includes("'") || content.includes("\\'")) {
+                        return `"${content}"`;
+                    }
                     return `'${content}'`;
                 }
                 return val;
@@ -848,13 +985,14 @@ fn do_work() ! {
                 }
             }
 
-            // Handle map lookup with ok check: _, ok := map[key]
+            // Handle map lookup with ok check: val, ok := map[key]
             if (node.Tok === ":=" && node.Lhs.length === 2 && 
                 node.Rhs.length === 1 && node.Rhs[0]._type === "IndexExpr") {
-                const secondVar = transpile(node.Lhs[1], ctx); // Will pick up renaming if any
+                const valVar = transpile(node.Lhs[0], ctx);
+                const secondVar = transpile(node.Lhs[1], ctx);
                 const mapExpr = transpile(node.Rhs[0].X, ctx);
                 const keyExpr = transpile(node.Rhs[0].Index, ctx);
-                return `${secondVar} := ${keyExpr} in ${mapExpr}`;
+                return `${secondVar} := ${keyExpr} in ${mapExpr}\n${valVar} := ${mapExpr}[${keyExpr}]`;
             }
 
             // Handle Go append: arr = append(arr, x) -> V: arr << x
@@ -880,19 +1018,45 @@ fn do_work() ! {
                      // If we blindly return `${lhs} = ${rhs}`, we get `x = x << y`.
                      // `x << y` returns the array, so `x = x` is assign to self. Safe but ugly?
                      // User wants `nums << 4`.
-                     
                      // We should check if lhs variable name matches the array being appended to.
-                     if (node.Lhs.length === 1 && node.Lhs[0]._type === "Ident") {
-                         const lhsName = node.Lhs[0].Name;
-                         if (rhsCall.Args && rhsCall.Args.length >= 1) {
-                             const appendFirstArg = rhsCall.Args[0];
-                             if (appendFirstArg._type === "Ident" && appendFirstArg.Name === lhsName) {
-                                 // Simple append: x = append(x, ...)
-                                 // Just return the RHS logic (which is "x << ...")
-                                 return rhs;
-                             }
-                         }
-                     }
+                      if (node.Lhs.length === 1 && node.Lhs[0]._type === "Ident") {
+                          const lhsName = node.Lhs[0].Name;
+                          if (rhsCall.Args && rhsCall.Args.length >= 1) {
+                              const appendFirstArg = rhsCall.Args[0];
+                              if (appendFirstArg._type === "Ident" && appendFirstArg.Name === lhsName) {
+                                  // Simple append: x = append(x, ...)
+                                  // Just return the RHS logic (which is "x << ...")
+                                  return rhs;
+                              }
+                          }
+                      }
+                }
+            }
+
+            // [PARSER WORKAROUND]: Split Initialization for Nested Maps
+            if (node.Tok === ":=" && node.Lhs.length === 1 && node.Rhs.length === 1 && node.Rhs[0]._type === "CompositeLit") {
+                const lit = node.Rhs[0];
+                if (lit.Type && lit.Type._type === "MapType" && 
+                    lit.Type.Value && lit.Type.Value._type === "MapType" && 
+                    lit.Elts && lit.Elts.length > 0) {
+                    
+                    const lhsNode = node.Lhs[0];
+                    const vName = transpile(lhsNode, ctx);
+                    const isMutated = ctx.remainingStmts && ctx.remainingStmts.some(stmt => isVariableMutated(stmt, lhsNode.Name, ctx));
+                    const mutStr = isMutated || lit.Elts.length > 0 ? "mut " : "";
+                    
+                    const mapType = transpile(lit.Type, ctx);
+                    const header = `${mutStr}${vName} := ${mapType}{}`;
+                    const assignments = lit.Elts.map(elt => {
+                        if (elt._type === "KeyValueExpr") {
+                            const k = transpile(elt.Key, ctx);
+                            const v = transpile(elt.Value, ctx);
+                            return `${vName}[${k}] = ${v}`;
+                        }
+                        return "";
+                    }).filter(s => s !== "");
+                    
+                    return [header, ...assignments].join("\n");
                 }
             }
 
@@ -908,14 +1072,40 @@ fn do_work() ! {
                     return s;
                 });
                 const lhsResult = lhsParts.join(", ");
-                // If any of the lhsParts has 'mut ', we don't need a global 'mut' at the start
-                // but if we are following V style, 'mut a, mut b := ...' is correct.
                 return `${lhsResult} := ${rhs}`;
+            }
+            
+            if (node.Tok === "=" && node.Lhs.length === 1 && node.Lhs[0]._type === "StarExpr") {
+                return `unsafe { ${lhsString} = ${rhs} }`;
             }
             return `${lhsString} = ${rhs}`;
 
         case "IfStmt":
             const ifCtx = cloneContext(ctx);
+            
+            // PEEP-HOLE: Go's if val, ok := m[key]; ok { ... }
+            if (node.Init && node.Init._type === "AssignStmt" && node.Init.Lhs.length === 2 && 
+                node.Init.Rhs.length === 1 && node.Init.Rhs[0]._type === "IndexExpr") {
+                const init = node.Init;
+                const rhsCall = init.Rhs[0];
+                const valVar = init.Lhs[0];
+                const okVar = init.Lhs[1];
+                
+                if (okVar._type === "Ident" && node.Cond._type === "Ident" && node.Cond.Name === okVar.Name) {
+                    const mapExpr = transpile(rhsCall.X, ifCtx);
+                    const keyExpr = transpile(rhsCall.Index, ifCtx);
+                    const valName = transpile(valVar, ifCtx);
+                    
+                    const ifBody = transpile(node.Body, ifCtx);
+                    // reff.v uses .clone() for nested map extraction to avoid V move error
+                    const inject = `${valName} := ${mapExpr}[${keyExpr}].clone()`;
+                    const newBody = ifBody.replace(/^{\s*/, `{\n    ${inject}\n    `);
+                    
+                    const elseStmt = node.Else ? " else " + transpile(node.Else, ifCtx) : "";
+                    return `if ${keyExpr} in ${mapExpr} ${newBody}${elseStmt}`;
+                }
+            }
+
             const ifInit = node.Init ? transpile(node.Init, ifCtx) + "; " : "";
             const ifCond = transpile(node.Cond, ifCtx);
             const ifBody = transpile(node.Body, ifCtx); 
@@ -983,6 +1173,12 @@ fn do_work() ! {
                 if (lastRes.startsWith("error(")) {
                     return `return ${lastRes}`;
                 }
+            } else if (retResults.length === 1) {
+                 if (ctx.funcResultTypes && ctx.funcResultTypes.length === 1 && ctx.funcResultTypes[0] === 'error') {
+                     if (retResults[0] === 'nil') {
+                         return "return";
+                     }
+                 }
             }
             
             return `return ${retResults.join(", ")}`;
@@ -991,6 +1187,15 @@ fn do_work() ! {
             const idxX = transpile(node.X, ctx);
             const idxIndex = transpile(node.Index, ctx);
             return `${idxX}[${idxIndex}]`;
+
+        case "SliceExpr":
+            const sliceX = transpile(node.X, ctx);
+            const sliceLow = node.Low ? transpile(node.Low, ctx) : "";
+            const sliceHigh = node.High ? transpile(node.High, ctx) : "";
+            if (!node.Low && !node.High) {
+                return `${sliceX}.clone()`;
+            }
+            return `${sliceX}[${sliceLow}..${sliceHigh}]`;
 
         case "SelectStmt":
             const selectBody = transpile(node.Body, ctx);
@@ -1003,6 +1208,57 @@ fn do_work() ! {
                 return `else {\n    ${commBody}\n}`;
             }
             return `${comm} {\n    ${commBody}\n}`;
+
+        case "TypeSwitchStmt":
+            const tsCtx = cloneContext(ctx);
+            let tsVar = "";
+            let tsExpr = "";
+            
+            if (node.Assign) {
+                if (node.Assign._type === "AssignStmt" && node.Assign.Rhs && node.Assign.Rhs[0]) {
+                    const typeAssert = node.Assign.Rhs[0];
+                    if (typeAssert._type === "TypeAssertExpr") {
+                        tsExpr = transpile(typeAssert.X, tsCtx);
+                    }
+                    if (node.Assign.Lhs && node.Assign.Lhs[0]) {
+                        tsVar = transpile(node.Assign.Lhs[0], tsCtx);
+                    }
+                }
+            }
+            
+            if (!tsExpr) tsExpr = "x";
+            tsCtx.typeSwitchVar = tsVar;
+            tsCtx.typeSwitchExpr = tsExpr;
+            
+            const tsCases = node.Body && node.Body.List ? node.Body.List.map(c => {
+                if (c._type === "CaseClause") {
+                    const caseCtx = cloneContext(tsCtx);
+                    if (!c.List || c.List.length === 0) {
+                        const body = c.Body ? c.Body.map(n => transpile(n, caseCtx)).join("\n        ") : "";
+                        return `else {\n        ${body}\n    }`;
+                    }
+                    const typeNames = c.List.map(t => transpile(t, { ...caseCtx, inTypeContext: true })).join(", ");
+                    const body = c.Body ? c.Body.map(n => transpile(n, caseCtx)).join("\n        ") : "";
+                    if (tsVar) {
+                        return `${typeNames} {\n        ${tsVar} := ${tsExpr}\n        ${body}\n    }`;
+                    }
+                    return `${typeNames} {\n        ${body}\n    }`;
+                }
+                return "";
+            }).join("\n    ") : "";
+            
+            return `match typeof(${tsExpr}).idx {\n    ${tsCases}\n}`;
+
+        case "TypeAssertExpr":
+            const taX = transpile(node.X, ctx);
+            if (node.Type) {
+                const taType = transpile(node.Type, { ...ctx, inTypeContext: true });
+                if (ctx.inAssignWithOk) {
+                    return `${taX} as ${taType}`;
+                }
+                return `${taX} as ${taType}`;
+            }
+            return taX;
 
         case "SwitchStmt":
             const switchTag = node.Tag ? transpile(node.Tag, ctx) : "true";
@@ -1089,11 +1345,19 @@ fn do_work() ! {
                 return `${cType}{}`;
             }
 
-            const elts = node.Elts.map((n) => transpile(n, ctx)).join(", ");
             if (node.Type && node.Type._type === "MapType") {
+                const elts = node.Elts ? node.Elts.map((n) => transpile(n, ctx)).join(", ") : "";
                 if (node.Elts && node.Elts.length > 0) return `{${elts}}`;
                 return `${cType}{}`;
             }
+
+            let structTypeName = null;
+            if (node.Type && node.Type._type === "Ident") {
+                structTypeName = node.Type.Name;
+            }
+            
+            const compositeCtx = { ...ctx, currentStructType: structTypeName };
+            const elts = node.Elts ? node.Elts.map((n) => transpile(n, compositeCtx)).join(", ") : "";
 
             return `${cType}{${elts}}`;
 
@@ -1101,8 +1365,9 @@ fn do_work() ! {
             let key = transpile(node.Key, ctx);
             if (node.Key._type === "Ident") {
                 const rawName = node.Key.Name;
-                // Heuristic: If key matches a known Struct Type, it's an embedded field init. Keep PascalCase.
-                if (ctx.knownStructs && ctx.knownStructs.has(rawName)) {
+                const structType = ctx.currentStructType;
+                const embeddedSet = structType ? EMBEDDED_FIELDS.get(structType) : null;
+                if (embeddedSet && embeddedSet.has(rawName)) {
                     key = rawName;
                 } else {
                     key = toSnakeCase(rawName);
@@ -1125,12 +1390,16 @@ fn do_work() ! {
             return `${tokLower}${branchLabel}`;
 
         case "StarExpr":
-            return `&${transpile(node.X, ctx)}`;
+            if (ctx.inTypeContext) {
+                return `&${transpile(node.X, ctx)}`;
+            }
+            return `*${transpile(node.X, ctx)}`;
 
         case "UnaryExpr":
             const op = node.Op;
             const unaryX = transpile(node.X, ctx);
             if (op === "<-") return `<-${unaryX}`;
+            if (op === "&" && ctx.inCallArg) return `mut &${unaryX}`;
             return `${op}${unaryX}`;
 
         case "BinaryExpr":
@@ -1199,9 +1468,15 @@ function transpileGenericParams(fieldList, ctx) {
 
 function transpileParams(fieldList, ctx) {
     if (!fieldList || !fieldList.List) return "()";
+    const typeCtx = { ...ctx, inTypeContext: true };
     const params = fieldList.List.map((f) => {
-        const type = transpile(f.Type, ctx);
-        return f.Names.map((n) => `${n.Name} ${type}`).join(", ");
+        const isPointer = f.Type._type === "StarExpr";
+        const type = transpile(f.Type, typeCtx);
+        const mutPrefix = isPointer ? "mut " : "";
+        if (!f.Names || f.Names.length === 0) {
+            return `${mutPrefix}${type}`;
+        }
+        return f.Names.map((n) => `${mutPrefix}${n.Name} ${type}`).join(", ");
     }).join(", ");
     return `(${params})`;
 }
@@ -1209,22 +1484,23 @@ function transpileParams(fieldList, ctx) {
 function transpileResults(fieldList, ctx) {
     if (!fieldList || !fieldList.List) return "";
 
+    const typeCtx = { ...ctx, inTypeContext: true };
     const list = fieldList.List;
     const lastType = list[list.length - 1].Type;
     const isErrorReturn = lastType._type === "Ident" && lastType.Name === "error";
 
     if (isErrorReturn) {
-        if (list.length === 1) return " !"; // func() error -> fn() !
+        if (list.length === 1) return " !";
         
-        const returnTypes = list.slice(0, -1).map(f => transpile(f.Type, ctx));
+        const returnTypes = list.slice(0, -1).map(f => transpile(f.Type, typeCtx));
         if (returnTypes.length === 1) return ` !${returnTypes[0]}`;
         return ` !(${returnTypes.join(", ")})`;
     }
 
     if (list.length === 1) {
-        return " " + transpile(list[0].Type, ctx);
+        return " " + transpile(list[0].Type, typeCtx);
     }
-    const types = list.map((f) => transpile(f.Type, ctx)).join(", ");
+    const types = list.map((f) => transpile(f.Type, typeCtx)).join(", ");
     return ` (${types})`;
 }
 
@@ -1311,7 +1587,6 @@ function isVariableMutated(node, varName, ctx) {
                     if (type && ctx.mutatingMethods && ctx.mutatingMethods.has(`${type}.${sel.Sel.Name}`)) {
                         mutated = true;
                     } else if (!type && ctx.mutatingMethods) {
-                        // Heuristic: if we don't know the type, check if this method is a mutating method for ANY struct
                         for (let entry of ctx.mutatingMethods) {
                             if (entry.endsWith(`.${sel.Sel.Name}`)) {
                                 mutated = true;
@@ -1320,6 +1595,16 @@ function isVariableMutated(node, varName, ctx) {
                         }
                     }
                 }
+            }
+            
+            if (n.Args) {
+                n.Args.forEach(arg => {
+                    if (arg._type === "UnaryExpr" && arg.Op === "&") {
+                        if (arg.X._type === "Ident" && arg.X.Name === varName) {
+                            mutated = true;
+                        }
+                    }
+                });
             }
         }
 
@@ -1367,10 +1652,11 @@ function isReceiverMutated(node, recvName) {
 function getClosureCaptures(funcNode) {
     const used = new Set();
     const declared = new Set();
+    const mutated = new Set();
 
-    if (funcNode.Type.Params.List) {
+    if (funcNode.Type.Params && funcNode.Type.Params.List) {
         funcNode.Type.Params.List.forEach((f) => {
-            f.Names.forEach((n) => declared.add(n.Name));
+            if (f.Names) f.Names.forEach((n) => declared.add(n.Name));
         });
     }
 
@@ -1385,6 +1671,14 @@ function getClosureCaptures(funcNode) {
             node.Lhs.forEach((lhs) => {
                 if (lhs._type === "Ident") declared.add(lhs.Name);
             });
+        }
+        if (node._type === "AssignStmt" && node.Tok === "=") {
+            node.Lhs.forEach((lhs) => {
+                if (lhs._type === "Ident") mutated.add(lhs.Name);
+            });
+        }
+        if (node._type === "IncDecStmt") {
+            if (node.X._type === "Ident") mutated.add(node.X.Name);
         }
         if (node._type === "GenDecl" && node.Tok === "var") {
             node.Specs.forEach((s) =>
@@ -1433,7 +1727,11 @@ function getClosureCaptures(funcNode) {
     const captures = [];
     used.forEach((v) => {
         if (!declared.has(v) && !GO_STD_PACKAGES.has(v)) {
-            captures.push(v);
+            if (mutated.has(v)) {
+                captures.push(`mut ${v}`);
+            } else {
+                captures.push(v);
+            }
         }
     });
 
