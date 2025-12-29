@@ -798,9 +798,12 @@ fn do_work() ! {
                                  if (r._type === "BasicLit" && r.Kind === "STRING") ctx.variableTypes[name] = "string";
                                  if (r._type === "CallExpr") {
                                       const rFun = transpile(r.Fun, ctx);
-                                      if (rFun === "[]u8" || rFun === "[]byte") ctx.variableTypes[name] = "[]u8";
-                                      if (rFun === "[]rune") ctx.variableTypes[name] = "[]rune";
-                                 }
+                                       if (rFun === "[]u8" || rFun === "[]byte") ctx.variableTypes[name] = "[]u8";
+                                       if (rFun === "[]rune") ctx.variableTypes[name] = "[]rune";
+                                  }
+                                  if (r._type === "CompositeLit") {
+                                       ctx.variableTypes[name] = transpile(r.Type, ctx);
+                                  }
                              }
                         }
                     }
@@ -1307,6 +1310,14 @@ function isVariableMutated(node, varName, ctx) {
                     const type = ctx.variableTypes ? ctx.variableTypes[varName] : null;
                     if (type && ctx.mutatingMethods && ctx.mutatingMethods.has(`${type}.${sel.Sel.Name}`)) {
                         mutated = true;
+                    } else if (!type && ctx.mutatingMethods) {
+                        // Heuristic: if we don't know the type, check if this method is a mutating method for ANY struct
+                        for (let entry of ctx.mutatingMethods) {
+                            if (entry.endsWith(`.${sel.Sel.Name}`)) {
+                                mutated = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
